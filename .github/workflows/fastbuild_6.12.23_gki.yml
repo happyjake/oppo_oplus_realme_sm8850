@@ -340,6 +340,20 @@ jobs:
           if [[ ${{ github.event.inputs.ksu_type }} != "none" ]]; then
             echo "正在添加susfs补丁..."
             git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+            # SUSFS mnt_id collision fix: raise DEFAULT_KSU_MNT_ID from 500000 to 0x40000000.
+            # Upstream SUSFS uses mnt_id>=500000 as a heuristic to tell KSU-created
+            # mounts from regular mounts. But Linux's regular mnt_id_ida grows past
+            # 500000 after ~hours of uptime on an active device (zygote fork creates
+            # 200+ mounts per app ns). Once regular IDs cross 500000, show_mountinfo
+            # / vfs_statfs hooks misclassify every regular mount as "sus" and return
+            # filtered/spoofed data to non-SU procs: empty /proc/self/mountinfo,
+            # statfs() returns rootmnt tmpfs for every path, getenforce prints
+            # "Disabled", PairIP/libnullptr anti-tamper apps crash.
+            # Bumping to 1<<30 (1.07B) pushes the collision threshold past any
+            # realistic uptime. INT_MAX is 2.14B so 1<<30 leaves 1B headroom.
+            sed -i 's|^#define DEFAULT_KSU_MNT_ID 500000|#define DEFAULT_KSU_MNT_ID 0x40000000|' \
+              ./susfs4ksu/kernel_patches/include/linux/susfs_def.h
+            grep '^#define DEFAULT_KSU_MNT_ID' ./susfs4ksu/kernel_patches/include/linux/susfs_def.h
             cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
             cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
             cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
