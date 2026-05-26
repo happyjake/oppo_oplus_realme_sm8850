@@ -369,7 +369,57 @@ jobs:
             cd ./KernelSU
             patch -p1 < 10_enable_susfs_for_ksu.patch || true
           fi
-          
+
+      - name: keep-visible — patch ReSukiSU dispatch
+        if: inputs.susfs_enable && (inputs.ksu_type == 'resukisu')
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/KernelSU
+          bash "${GITHUB_WORKSPACE}/patches-keep-visible/02-kernelsu-patch.sh"
+
+      - name: keep-visible — patch common kernel (clone_mnt + handler)
+        if: inputs.susfs_enable
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/common
+          bash "${GITHUB_WORKSPACE}/patches-keep-visible/01-common-patch.sh"
+
+      - name: keep-visible — patch ksud CLI source
+        if: inputs.susfs_enable && (inputs.ksu_type == 'resukisu')
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/KernelSU/userspace/ksud
+          bash "${GITHUB_WORKSPACE}/patches-keep-visible/03-ksud-patch.sh"
+
+      - name: keep-visible — setup Rust nightly + cargo-ndk
+        if: inputs.susfs_enable && (inputs.ksu_type == 'resukisu')
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+          targets: aarch64-linux-android
+          components: rust-src
+
+      - name: keep-visible — build patched ksud (aarch64-linux-android)
+        if: inputs.susfs_enable && (inputs.ksu_type == 'resukisu')
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-ndk
+          cd kernel_workspace/KernelSU/userspace/ksud
+          cargo ndk -t aarch64-linux-android build --release \
+            -Z build-std=std,core,panic_abort \
+            -Z build-std-features="optimize_for_size" \
+            -Z trim-paths
+          ls -la target/aarch64-linux-android/release/
+          echo "ksud size: $(stat -c%s target/aarch64-linux-android/release/ksud) bytes"
+          strings target/aarch64-linux-android/release/ksud | grep -c keep-visible || echo "WARN: 'keep-visible' string not found in built ksud"
+
+      - name: keep-visible — upload patched ksud artifact
+        if: inputs.susfs_enable && (inputs.ksu_type == 'resukisu')
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksud-keep-visible-aarch64-linux-android
+          path: kernel_workspace/KernelSU/userspace/ksud/target/aarch64-linux-android/release/ksud
+
       - name: 应用lz4 1.10.0 & zstd 1.5.7补丁
         if: inputs.lz4_enable
         run: |
