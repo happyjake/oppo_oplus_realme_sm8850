@@ -101,6 +101,9 @@ jobs:
       actions: write
       contents: read
     steps:
+      - name: Checkout this repo (so patches-keep-visible/ is available)
+        uses: actions/checkout@v4
+
       - name: 安装环境依赖+初始化源码仓库及llvm-clang19工具链
         run: |
           rm -rf kernel_workspace
