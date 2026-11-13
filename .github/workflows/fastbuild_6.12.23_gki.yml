@@ -123,7 +123,9 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # ubuntu-latest moved to 26.04 (2026-10): its glibc's C23 strchr returns const char *,
+    # and the host libbpf build for resolve_btfids fails -Wincompatible-pointer-types-discards-qualifiers.
+    runs-on: ubuntu-24.04
     outputs:
       ksuver: ${{ steps.ksu_version.outputs.ksuver }}
       ak3name: ${{ steps.create_zip.outputs.ak3name }}
