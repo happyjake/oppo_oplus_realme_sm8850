@@ -90,6 +90,31 @@ on:
         required: false
         type: string
         default: ''
+      droidspaces_enable:
+        description: 'Droidspaces container support (patches-droidspaces/: SYSVIPC kABI patch + PID/IPC namespaces etc.)'
+        required: false
+        type: boolean
+        default: false
+      resukisu_ref:
+        description: 'Pin ReSukiSU to this commit (empty = latest main)'
+        required: false
+        type: string
+        default: ''
+      susfs_ref:
+        description: 'Pin susfs4oki to this commit (empty = branch head)'
+        required: false
+        type: string
+        default: ''
+      kpm_patch_tag:
+        description: 'Pin SukiSU_KernelPatch_patch to this release tag (empty = latest)'
+        required: false
+        type: string
+        default: ''
+      anykernel3_ref:
+        description: 'Pin cctv18/AnyKernel3 to this commit (empty = HEAD)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   build:
@@ -240,6 +265,8 @@ jobs:
 
       - name: 添加KernelSU
         id: ksu_version
+        env:
+          RESUKISU_REF: ${{ inputs.resukisu_ref }}
         run: |
           # 进入内核工作目录
           cd kernel_workspace
@@ -301,11 +328,20 @@ jobs:
             echo "SukiSU版本号: v${KSU_API_VERSION}-${GIT_COMMIT_HASH}@cctv18"
           elif [[ ${{ github.event.inputs.ksu_type }} == "resukisu" ]]; then
             echo "正在配置ReSukiSU..."
-            curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/refs/heads/main/kernel/setup.sh" | bash -s main
+            if [[ -n "$RESUKISU_REF" ]]; then
+              # setup.sh falls back to the default branch when the checkout fails, so assert the HEAD it left.
+              curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/$RESUKISU_REF/kernel/setup.sh" | bash -s "$RESUKISU_REF"
+              got=$(git -C ./KernelSU rev-parse HEAD)
+              [[ "$got" == "$RESUKISU_REF"* ]] || { echo "ERROR: ReSukiSU at $got, wanted $RESUKISU_REF"; exit 1; }
+              KSU_COUNT_REF=HEAD
+            else
+              curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/refs/heads/main/kernel/setup.sh" | bash -s main
+              KSU_COUNT_REF=main
+            fi
             echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
             cd ./KernelSU
             # 生成自定义版本号（基于提交计数）, 失败时使用 114514
-            KSU_VERSION=$(expr $(git rev-list --count main) + 30700 2>/dev/null || echo 114514)
+            KSU_VERSION=$(expr $(git rev-list --count $KSU_COUNT_REF) + 30700 2>/dev/null || echo 114514)
             # 存储版本号到 GitHub 环境变量
             echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
             echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
@@ -338,11 +374,19 @@ jobs:
 
       - name: 应用 KernelSU & SUSFS 补丁
         if: inputs.susfs_enable
+        env:
+          SUSFS_REF: ${{ inputs.susfs_ref }}
         run: |
           cd kernel_workspace
           if [[ ${{ github.event.inputs.ksu_type }} != "none" ]]; then
             echo "正在添加susfs补丁..."
-            git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+            if [[ -n "$SUSFS_REF" ]]; then
+              git clone https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+              git -C susfs4ksu checkout --quiet "$SUSFS_REF"
+              echo "susfs4oki pinned at $(git -C susfs4ksu rev-parse HEAD)"
+            else
+              git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+            fi
             # SUSFS mnt_id collision fix: raise DEFAULT_KSU_MNT_ID from 500000 to 0x40000000.
             # Upstream SUSFS uses mnt_id>=500000 as a heuristic to tell KSU-created
             # mounts from regular mounts. But Linux's regular mnt_id_ida grows past
@@ -531,6 +575,13 @@ jobs:
           cd common
           wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/config.patch
           patch -p1 -F 3 < config.patch || true
+
+      - name: Droidspaces — kABI patch + defconfig + VINTF mask
+        if: inputs.droidspaces_enable
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/common
+          bash "${GITHUB_WORKSPACE}/patches-droidspaces/apply.sh"
 
       - name: 添加 BBR 等一系列拥塞控制算法
         run: |
@@ -747,6 +798,21 @@ jobs:
           echo "编译后空间:"
           df -h
 
+      - name: Droidspaces — verify config + collect ABI evidence
+        if: inputs.droidspaces_enable
+        run: |
+          set -euo pipefail
+          command -v pahole >/dev/null || sudo apt-get install -y --no-install-recommends dwarves >/dev/null
+          cd kernel_workspace/common
+          bash "${GITHUB_WORKSPACE}/patches-droidspaces/verify.sh" "${GITHUB_WORKSPACE}/droidspaces-evidence"
+
+      - name: Droidspaces — upload ABI evidence
+        if: inputs.droidspaces_enable && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: droidspaces-evidence
+          path: droidspaces-evidence/
+
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
@@ -755,11 +821,17 @@ jobs:
           key: ${{ env.CCACHE_KEY }}-${{ runner.os }}-${{ github.ref_name }}
          
       - name: 应用KPM并修补内核
+        env:
+          KPM_PATCH_TAG: ${{ inputs.kpm_patch_tag }}
         run: |
           if [[ ${{ github.event.inputs.kpm_enable }} == 'builtin' && ( "${{ github.event.inputs.ksu_type }}" == "sukisu" || "${{ github.event.inputs.ksu_type }}" == "resukisu" ) ]]; then
             echo "正在应用KPM并修补内核..."
             cd kernel_workspace/common/out/arch/arm64/boot
-            curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/latest/download/patch_linux
+            if [[ -n "$KPM_PATCH_TAG" ]]; then
+              curl -fLO "https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/$KPM_PATCH_TAG/patch_linux"
+            else
+              curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/latest/download/patch_linux
+            fi
             chmod +x patch_linux
             ./patch_linux
             rm -f Image
@@ -778,9 +850,16 @@ jobs:
           
       - name: 克隆 AnyKernel3 并打包
         id: create_zip
+        env:
+          ANYKERNEL3_REF: ${{ inputs.anykernel3_ref }}
         run: |
           cd kernel_workspace
-          git clone https://github.com/cctv18/AnyKernel3 --depth=1
+          if [[ -n "$ANYKERNEL3_REF" ]]; then
+            git clone https://github.com/cctv18/AnyKernel3
+            git -C AnyKernel3 checkout --quiet "$ANYKERNEL3_REF"
+          else
+            git clone https://github.com/cctv18/AnyKernel3 --depth=1
+          fi
           rm -rf ./AnyKernel3/.git
           cd AnyKernel3
           cp ../common/out/arch/arm64/boot/Image ./Image
