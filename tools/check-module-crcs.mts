@@ -8,14 +8,26 @@
 //
 //   check-module-crcs.mts <vmlinux.symvers> <loaded.txt> <ko-dir>...
 //
-// loaded.txt: module names, one per line (cut -d' ' -f1 /proc/modules).
+// loaded.txt: one loaded module per line, "name" or "name build-id". With a
+// build-id, only the file with that build-id counts as loaded: a phone often
+// carries several copies of a module (vendor_boot, vendor_dlkm, system_dlkm)
+// and only the first one loaded is in use. Get it from the phone with
+//   for m in $(cut -d' ' -f1 /proc/modules); do
+//     echo "$m $(od -An -tx1 /sys/module/$m/notes/.note.gnu.build-id | tr -d ' \n' | tail -c 40)"
+//   done
 // Exit 0: no loaded module imports a vmlinux symbol whose CRC changed.
 // Exit 1: at least one does (listed). Exit 2: usage or input error.
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 type Section = { name: string; offset: number; size: number; link: number };
-type Module = { file: string; name: string; imports: Map<string, number>; exports: string[] };
+type Module = {
+  file: string;
+  name: string;
+  buildId: string;
+  imports: Map<string, number>;
+  exports: string[];
+};
 
 function sections(buf: Buffer): Section[] {
   if (buf.readUInt32BE(0) !== 0x7f454c46 || buf[4] !== 2 || buf[5] !== 1) {
@@ -81,6 +93,15 @@ function parseModule(file: string): Module {
   }
   if (!name) name = file.replace(/^.*\//, "").replace(/\.ko$/, "").replace(/-/g, "_");
 
+  let buildId = "";
+  const note = byName.get(".note.gnu.build-id");
+  if (note) {
+    const namesz = buf.readUInt32LE(note.offset);
+    const descsz = buf.readUInt32LE(note.offset + 4);
+    const desc = note.offset + 12 + ((namesz + 3) & ~3);
+    buildId = buf.toString("hex", desc, desc + descsz);
+  }
+
   const exports: string[] = [];
   const symtab = byName.get(".symtab");
   if (symtab) {
@@ -90,7 +111,7 @@ function parseModule(file: string): Module {
       if (sym.startsWith("__ksymtab_")) exports.push(sym.slice("__ksymtab_".length));
     }
   }
-  return { file, name, imports, exports };
+  return { file, name, buildId, imports, exports };
 }
 
 function koFiles(dir: string): string[] {
@@ -103,10 +124,19 @@ function koFiles(dir: string): string[] {
   return out;
 }
 
-function readLoaded(path: string): Set<string> {
-  return new Set(
-    readFileSync(path, "utf8").split("\n").map((l) => l.trim()).filter((l) => l.length > 0),
-  );
+// name -> build-id of the loaded copy ("" when loaded.txt gives none)
+function readLoaded(path: string): Map<string, string> {
+  const loaded = new Map<string, string>();
+  for (const line of readFileSync(path, "utf8").split("\n")) {
+    const [name, id] = line.trim().split(/\s+/);
+    if (name) loaded.set(name, id && id !== "-" ? id : "");
+  }
+  return loaded;
+}
+
+function isLoaded(loaded: Map<string, string>, m: Module): boolean {
+  const id = loaded.get(m.name);
+  return id !== undefined && (id === "" || id === m.buildId);
 }
 
 // --derive: print the running kernel's CRCs as the loaded modules recorded
@@ -119,7 +149,7 @@ if (process.argv[2] === "--derive") {
     process.exit(2);
   }
   const loaded = readLoaded(loadedPath);
-  const modules = dirs.flatMap(koFiles).map(parseModule).filter((m) => loaded.has(m.name));
+  const modules = dirs.flatMap(koFiles).map(parseModule).filter((m) => isLoaded(loaded, m));
   const moduleExports = new Set(modules.flatMap((m) => m.exports));
   const crcs = new Map<string, { crc: number; from: string }>();
   let conflicts = 0;
@@ -161,10 +191,9 @@ if (kernel.size === 0) {
 const loaded = readLoaded(loadedPath);
 const modules = dirs.flatMap(koFiles).map(parseModule);
 const moduleExports = new Set(modules.flatMap((m) => m.exports));
-const found = new Set(modules.map((m) => m.name));
+const found = new Set(modules.filter((m) => isLoaded(loaded, m)).map((m) => m.name));
 
 let broken = 0;
-let checked = 0;
 let compared = 0;
 const unresolved = new Map<string, string[]>();
 const notLoadedBroken: string[] = [];
@@ -181,23 +210,24 @@ for (const m of modules) {
       bad.push(`${sym} module=0x${crc.toString(16).padStart(8, "0")} kernel=0x${want.toString(16).padStart(8, "0")}`);
     }
   }
-  if (loaded.has(m.name)) checked++;
   if (bad.length === 0) continue;
-  if (loaded.has(m.name)) {
+  if (isLoaded(loaded, m)) {
     broken++;
     console.log(`BROKEN (loaded now) ${m.name}  ${m.file}`);
     for (const b of bad) console.log(`    ${b}`);
   } else {
-    notLoadedBroken.push(`${m.name} (${bad.length} symbols)`);
+    const why = loaded.has(m.name) ? "a different copy is loaded" : "not loaded";
+    notLoadedBroken.push(`${m.name} [${why}] (${bad.length} symbols) ${m.file}`);
   }
 }
 
-const missing = [...loaded].filter((n) => !found.has(n));
+const missing = [...loaded.keys()].filter((n) => !found.has(n));
 console.log(`\nkernel symbols: ${kernel.size}; module files: ${modules.length}; CRCs compared: ${compared}`);
-console.log(`loaded modules: ${loaded.size}; with a .ko here: ${loaded.size - missing.length}`);
-if (missing.length > 0) console.log(`loaded but no .ko found (not checked): ${missing.join(" ")}`);
+console.log(`loaded modules: ${loaded.size}; loaded copy found here: ${loaded.size - missing.length}`);
+if (missing.length > 0) console.log(`loaded but no matching .ko found (not checked): ${missing.join(" ")}`);
 if (notLoadedBroken.length > 0) {
-  console.log(`CRC mismatches in modules not loaded now (were they ever?): ${notLoadedBroken.join(", ")}`);
+  console.log(`CRC mismatches in files that are not the loaded copy:`);
+  for (const n of notLoadedBroken) console.log(`    ${n}`);
 }
 if (unresolved.size > 0) {
   console.log(`imports found in neither the kernel nor any module: ${unresolved.size}`);
