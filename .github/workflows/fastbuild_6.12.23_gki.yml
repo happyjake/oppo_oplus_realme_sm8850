@@ -115,6 +115,11 @@ on:
         required: false
         type: string
         default: ''
+      rust_toolchain:
+        description: 'Rust toolchain for the patched ksud, e.g. nightly-2026-05-26 (empty = latest nightly)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   build:
@@ -442,7 +447,7 @@ jobs:
         if: inputs.susfs_enable && (inputs.ksu_type == 'resukisu')
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly
+          toolchain: ${{ inputs.rust_toolchain || 'nightly' }}
           targets: aarch64-linux-android
           components: rust-src
 
